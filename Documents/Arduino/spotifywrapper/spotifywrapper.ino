@@ -1,0 +1,674 @@
+/*
+  Spotify Album Art Display with ESP32 & TFT_eSPI
+  UPDATE:
+  1. OPTIMIZATION: Global Image Buffer (Prevents heap fragmentation/crashes).
+  2. OPTIMIZATION: Max CPU Speed (240MHz).
+  3. OPTIMIZATION: Increased Network Read Buffer (4KB).
+  4. OPTIMIZATION: String memory reservation in text wrapper.
+*/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>         
+#include <SpotifyArduino.h>
+#include <ArduinoJson.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>       
+#include <TJpg_Decoder.h>
+#include <U8g2_for_TFT_eSPI.h> 
+#include <vector>
+#include "secrets.h"
+
+// --- DISPLAY SETTINGS ---
+TFT_eSPI tft = TFT_eSPI(); 
+U8g2_for_TFT_eSPI u8f; 
+
+// --- RESOLUTION FIX ---
+#define FORCE_SCREEN_HEIGHT 320 
+
+// --- NETWORK & SPOTIFY ---
+WiFiClientSecure client;
+SpotifyArduino spotify(client, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REFRESH_TOKEN);
+
+// --- LYRICS STRUCTURE ---
+struct LyricLine {
+  long timestamp; // in milliseconds
+  String text;
+};
+std::vector<LyricLine> currentLyrics;
+int currentLyricIndex = -1;
+bool hasLyrics = false;
+
+// --- MEMORY OPTIMIZATION: GLOBAL IMAGE BUFFER ---
+// Keeping this global prevents re-allocation and fragmentation every song
+std::vector<uint8_t> jpgData; 
+
+// --- GLOBAL VARIABLES ---
+unsigned long lastCheck = 0;
+unsigned long lastButtonPress = 0;
+unsigned long lastProgressBarUpdate = 0;
+int currentVolume = 30;
+bool isSpotifyPlaying = false;
+String lastTrackURI = ""; 
+bool forceRedraw = false; 
+
+// Volume Overlay Logic
+unsigned long lastVolumeChangeTime = 0;
+bool isVolumeVisible = false;
+
+// Mode State
+bool isKaraokeMode = false; 
+
+// Progress Tracking
+long songDuration = 0;
+long songProgress = 0;
+unsigned long lastSongFetchTime = 0;
+int lastBarWidth = 0; 
+
+// --- COLORS ---
+uint16_t dominantColor = 0x1DB9; // Fixed Spotify Green
+uint16_t backgroundColor = TFT_BLACK;
+
+// --- LAYOUT CONSTANTS ---
+const int IMG_X = 180;
+const int IMG_Y = 0; 
+const int TEXT_X = 10;
+const int TEXT_W = 160; 
+int lyricY = 180; 
+
+// --- PIN DEFINITIONS ---
+#define BTN_PREV      12
+#define BTN_PLAY      13
+#define BTN_NEXT      14
+#define BTN_VOL_DOWN  26
+#define BTN_VOL_UP    27
+#define BOOT_BUTTON   0 
+
+//Helper to get correct height
+int getScreenHeight() {
+  if (FORCE_SCREEN_HEIGHT > 0) return FORCE_SCREEN_HEIGHT;
+  return tft.height();
+}
+
+// =========================================================================
+//   JPEG DECODER CALLBACK
+// =========================================================================
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  if (y >= getScreenHeight()) return 0;
+  tft.pushImage(x, y, w, h, bitmap);
+  return 1;
+}
+
+// =========================================================================
+//   SETUP
+// =========================================================================
+void setup() {
+  // OPTIMIZATION: Ensure ESP32 runs at max speed
+  setCpuFrequencyMhz(240);
+
+  Serial.begin(115200);
+  Serial.println("\n\n--- ESP32 Spotify Booting ---");
+
+  // OPTIMIZATION: Pre-allocate image memory to prevent runtime fragmentation
+  // 40KB is usually enough for Spotify "Medium" images
+  jpgData.reserve(40000); 
+
+  pinMode(BTN_PREV, INPUT_PULLUP);
+  pinMode(BTN_PLAY, INPUT_PULLUP);
+  pinMode(BTN_NEXT, INPUT_PULLUP);
+  pinMode(BTN_VOL_DOWN, INPUT_PULLUP); 
+  pinMode(BTN_VOL_UP, INPUT_PULLUP);   
+  pinMode(BOOT_BUTTON, INPUT_PULLUP);
+
+  tft.init();
+  tft.setRotation(1); 
+  tft.fillScreen(TFT_BLACK);
+  
+  u8f.begin(tft);                 
+  u8f.setFontMode(1); // 1 = Transparent Background
+  u8f.setFontDirection(0);        
+  u8f.setForegroundColor(TFT_WHITE);
+  u8f.setBackgroundColor(TFT_BLACK); 
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.println("Connecting...");
+  
+  TJpgDec.setJpgScale(1);      
+  TJpgDec.setSwapBytes(true);  
+  TJpgDec.setCallback(tft_output);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(10, 10);
+  tft.println("WiFi Connected");
+  delay(1000);
+
+  client.setInsecure(); 
+
+  tft.println("Auth Spotify...");
+  if (spotify.refreshAccessToken()) {
+    Serial.println("Token refreshed!");
+    tft.println("Ready!");
+    delay(1000);
+    tft.fillScreen(TFT_BLACK);
+  } else {
+    tft.setTextColor(TFT_RED);
+    tft.println("Auth Failed!");
+  }
+}
+
+// =========================================================================
+//   MAIN LOOP
+// =========================================================================
+void loop() {
+  handleButtons();
+
+  if ((millis() - lastCheck > 3000) || lastCheck == 0) { 
+    lastCheck = millis();
+    
+    int status = spotify.getCurrentlyPlaying(printCurrentlyPlaying, SPOTIFY_MARKET);
+    
+    if (status == 204) {
+      if (isSpotifyPlaying) { 
+        isSpotifyPlaying = false;
+        tft.fillScreen(TFT_BLACK);
+        u8f.setFont(u8g2_font_helvB14_tf); 
+        u8f.setCursor(10, 100);
+        u8f.print("Paused / Idle");
+      }
+    } else if (status == 401) {
+      spotify.refreshAccessToken();
+    }
+  }
+
+  if (isSpotifyPlaying && songDuration > 0) {
+    if (millis() - lastProgressBarUpdate > 100) {
+      lastProgressBarUpdate = millis();
+      updateProgressBar();
+      if (isKaraokeMode) updateKaraokeScroll();
+      else updateLyrics();
+    }
+  }
+
+  if (isVolumeVisible && (millis() - lastVolumeChangeTime > 3000)) {
+    isVolumeVisible = false;
+    tft.fillRect(TEXT_X, 0, 100, 20, backgroundColor);
+  }
+}
+
+// =========================================================================
+//   LYRICS & TEXT HELPERS
+// =========================================================================
+String urlEncode(String str) {
+    String encodedString = "";
+    encodedString.reserve(str.length() * 3); // Optimize allocation
+    char c;
+    char code0;
+    char code1;
+    for (int i = 0; i < str.length(); i++) {
+        c = str.charAt(i);
+        if (c == ' ') encodedString += "%20";
+        else if (isalnum(c)) encodedString += c;
+        else {
+            code1 = (c & 0xf) + '0';
+            if ((c & 0xf) > 9) code1 = (c & 0xf) - 10 + 'A';
+            c = (c >> 4) & 0xf;
+            code0 = c + '0';
+            if (c > 9) code0 = c - 10 + 'A';
+            encodedString += '%';
+            encodedString += code0;
+            encodedString += code1;
+        }
+    }
+    return encodedString;
+}
+
+void parseLrc(String lrcContent) {
+  currentLyrics.clear();
+  // Usually lyrics have 30-50 lines, reserve to prevent re-allocs
+  if (currentLyrics.capacity() < 50) currentLyrics.reserve(50);
+  
+  int start = 0;
+  while (start < lrcContent.length()) {
+    int end = lrcContent.indexOf('\n', start);
+    if (end == -1) end = lrcContent.length();
+    
+    String line = lrcContent.substring(start, end);
+    line.trim();
+    
+    if (line.startsWith("[") && line.indexOf("]") > 0) {
+      int bracketEnd = line.indexOf("]");
+      String timePart = line.substring(1, bracketEnd);
+      String textPart = line.substring(bracketEnd + 1);
+      textPart.trim();
+      
+      int colonIndex = timePart.indexOf(":");
+      int dotIndex = timePart.indexOf(".");
+      
+      if (colonIndex > 0) {
+        long min = timePart.substring(0, colonIndex).toInt();
+        long sec = 0;
+        long ms = 0;
+        if (dotIndex > 0) {
+           sec = timePart.substring(colonIndex + 1, dotIndex).toInt();
+           String msPart = timePart.substring(dotIndex + 1);
+           if (msPart.length() == 2) ms = msPart.toInt() * 10;
+           else if (msPart.length() == 3) ms = msPart.toInt();
+        } else {
+           sec = timePart.substring(colonIndex + 1).toInt();
+        }
+        long totalMs = (min * 60000) + (sec * 1000) + ms;
+        currentLyrics.push_back({totalMs, textPart});
+      }
+    }
+    start = end + 1;
+  }
+}
+
+void fetchLyrics(String trackName, String artistName) {
+  hasLyrics = false;
+  currentLyricIndex = -1;
+  currentLyrics.clear();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = "https://lrclib.net/api/get?artist_name=" + urlEncode(artistName) + "&track_name=" + urlEncode(trackName);
+    http.begin(url);
+    int httpCode = http.GET();
+    
+    if (httpCode == 200) {
+      String payload = http.getString();
+      JsonDocument doc; 
+      DeserializationError error = deserializeJson(doc, payload);
+      if (!error) {
+        if (doc.containsKey("syncedLyrics") && !doc["syncedLyrics"].isNull()) {
+           String rawLrc = doc["syncedLyrics"].as<String>();
+           parseLrc(rawLrc);
+           if (currentLyrics.size() > 0) hasLyrics = true;
+        }
+      }
+    }
+    http.end();
+  }
+}
+
+String truncateText(String text, int maxWidth) {
+  if (u8f.getUTF8Width(text.c_str()) <= maxWidth) return text;
+  String result = text;
+  while (u8f.getUTF8Width((result + "...").c_str()) > maxWidth && result.length() > 0) {
+      int len = result.length();
+      int charStart = len - 1;
+      while (charStart > 0 && (result[charStart] & 0xC0) == 0x80) charStart--;
+      result = result.substring(0, charStart);
+  }
+  return result + "...";
+}
+
+int drawWrappedText(String text, int x, int y, int maxWidth, int lineHeight, int maxLines) {
+  int currentY = y; 
+  String currentLine = "";
+  currentLine.reserve(text.length()); // Optimize allocation
+  int lineCount = 0;
+  
+  for (int i = 0; i < text.length(); i++) {
+    char c = text[i];
+    String glyph = "";
+    glyph += c;
+    
+    if ((c & 0x80) != 0) { 
+      if ((c & 0xE0) == 0xC0 && i+1 < text.length()) { glyph += text[++i]; }
+      else if ((c & 0xF0) == 0xE0 && i+2 < text.length()) { glyph += text[++i]; glyph += text[++i]; }
+      else if ((c & 0xF8) == 0xF0 && i+3 < text.length()) { glyph += text[++i]; glyph += text[++i]; glyph += text[++i]; }
+    }
+    
+    int w = u8f.getUTF8Width((currentLine + glyph).c_str());
+    
+    if (w > maxWidth) {
+      if (lineCount >= maxLines - 1) {
+         String textToPrint = currentLine;
+         while (u8f.getUTF8Width((textToPrint + "...").c_str()) > maxWidth && textToPrint.length() > 0) {
+             int len = textToPrint.length();
+             if (len == 0) break;
+             int charStart = len - 1;
+             while (charStart > 0 && (textToPrint[charStart] & 0xC0) == 0x80) charStart--;
+             textToPrint = textToPrint.substring(0, charStart);
+         }
+         u8f.setCursor(x, currentY);
+         u8f.print((textToPrint + "...").c_str());
+         return currentY + lineHeight;
+      }
+      
+      int lastSpace = currentLine.lastIndexOf(' ');
+      if (lastSpace > 0 && lastSpace > currentLine.length() / 2) {
+         String lineToPrint = currentLine.substring(0, lastSpace);
+         u8f.setCursor(x, currentY);
+         u8f.print(lineToPrint.c_str());
+         currentLine = currentLine.substring(lastSpace + 1) + glyph;
+      } else {
+         u8f.setCursor(x, currentY);
+         u8f.print(currentLine.c_str());
+         currentLine = glyph;
+      }
+      currentY += lineHeight;
+      lineCount++;
+      if (currentY > getScreenHeight() - 25) return currentY; 
+    } else {
+      currentLine += glyph;
+    }
+  }
+  
+  if (currentLine.length() > 0 && lineCount < maxLines) {
+    u8f.setCursor(x, currentY);
+    u8f.print(currentLine.c_str());
+    return currentY + lineHeight;
+  }
+  return currentY;
+}
+
+// =========================================================================
+//   STANDARD VIEW DRAWING
+// =========================================================================
+void drawSongInfo(CurrentlyPlaying currentlyPlaying) {
+  u8f.setFont(u8g2_font_wqy16_t_gb2312); 
+  u8f.setForegroundColor(TFT_WHITE);
+  u8f.setBackgroundColor(TFT_BLACK);
+  
+  int cursorY = 25; 
+  cursorY = drawWrappedText(String(currentlyPlaying.trackName), TEXT_X, cursorY, TEXT_W, 24, 3);
+  cursorY += 5; 
+
+  if (currentlyPlaying.numArtists > 0) {
+    cursorY = drawWrappedText(String(currentlyPlaying.artists[0].artistName), TEXT_X, cursorY, TEXT_W, 24, 2);
+  }
+  cursorY += 5; 
+
+  String albumStr = truncateText(String(currentlyPlaying.albumName), TEXT_W);
+  u8f.setForegroundColor(TFT_WHITE); 
+  u8f.setCursor(TEXT_X, cursorY);
+  u8f.print(albumStr.c_str());
+  cursorY += 24; 
+
+  lyricY = cursorY + 30;
+}
+
+void updateLyrics() {
+  if (!hasLyrics || currentLyrics.empty()) return;
+  long currentMs = songProgress + (millis() - lastSongFetchTime);
+  int activeIndex = -1;
+  for (int i = 0; i < currentLyrics.size(); i++) {
+    if (currentMs >= currentLyrics[i].timestamp) activeIndex = i; else break; 
+  }
+  
+  if (activeIndex != -1 && activeIndex != currentLyricIndex) {
+    currentLyricIndex = activeIndex;
+    String text = currentLyrics[activeIndex].text;
+    int fontHeight = 16; 
+    int clearY = lyricY - fontHeight;
+    int clearH = (getScreenHeight() - 10) - clearY;
+    if (clearH > 0) {
+      tft.fillRect(TEXT_X, clearY, TEXT_W, clearH, backgroundColor); 
+      if (text.length() > 0) {
+         u8f.setFont(u8g2_font_wqy16_t_gb2312); 
+         u8f.setForegroundColor(TFT_WHITE);
+         u8f.setBackgroundColor(TFT_BLACK); 
+         drawWrappedText(text, TEXT_X, lyricY, TEXT_W, 24, 5); 
+      }
+    }
+  }
+}
+
+// =========================================================================
+//   KARAOKE VIEW DRAWING
+// =========================================================================
+void drawKaraokeHeader(CurrentlyPlaying currentlyPlaying) {
+  u8f.setFont(u8g2_font_wqy16_t_gb2312); 
+  u8f.setForegroundColor(TFT_WHITE);
+  u8f.setBackgroundColor(TFT_BLACK); 
+  
+  int y = 30;
+  String title = String(currentlyPlaying.trackName);
+  String artist = "";
+  if (currentlyPlaying.numArtists > 0) artist = String(currentlyPlaying.artists[0].artistName);
+  
+  int titleW = u8f.getUTF8Width(title.c_str());
+  int titleX = (tft.width() - titleW) / 2;
+  if (titleX < 0) titleX = 0; 
+  u8f.setCursor(titleX, y);
+  u8f.print(title.c_str());
+  
+  y += 25;
+  
+  u8f.setForegroundColor(0xDDDD); 
+  int artW = u8f.getUTF8Width(artist.c_str());
+  int artX = (tft.width() - artW) / 2;
+  if (artX < 0) artX = 0; 
+  u8f.setCursor(artX, y);
+  u8f.print(artist.c_str());
+  
+  tft.drawFastHLine(20, y + 15, tft.width() - 40, TFT_DARKGREY);
+}
+
+void updateKaraokeScroll() {
+  if (!hasLyrics || currentLyrics.empty()) return;
+  
+  long currentMs = songProgress + (millis() - lastSongFetchTime);
+  int activeIndex = -1;
+  for (int i = 0; i < currentLyrics.size(); i++) {
+    if (currentMs >= currentLyrics[i].timestamp) activeIndex = i; else break; 
+  }
+  
+  if (activeIndex != currentLyricIndex) {
+    currentLyricIndex = activeIndex;
+    
+    int lyricAreaTop = 71; 
+    tft.fillRect(0, lyricAreaTop, tft.width(), getScreenHeight() - lyricAreaTop - 10, TFT_BLACK);
+    
+    int lineHeight = 30; 
+    int centerY = 180;   
+    int fontAscent = 20; 
+    
+    u8f.setFont(u8g2_font_wqy16_t_gb2312);
+    u8f.setBackgroundColor(TFT_BLACK); 
+    
+    for (int i = activeIndex - 4; i <= activeIndex + 4; i++) {
+      if (i >= 0 && i < currentLyrics.size()) {
+        int yPos = centerY + ((i - activeIndex) * lineHeight);
+        int lineTop = yPos - fontAscent;
+        
+        if (lineTop > lyricAreaTop && yPos < getScreenHeight() - 15) {
+          String txt = currentLyrics[i].text;
+          int txtW = u8f.getUTF8Width(txt.c_str());
+          int txtX = (tft.width() - txtW) / 2;
+          if (txtX < 10) txtX = 10;
+          
+          if (i == activeIndex) {
+            u8f.setForegroundColor(TFT_YELLOW); 
+          } else {
+            u8f.setForegroundColor(TFT_LIGHTGREY); 
+          }
+          
+          u8f.setCursor(txtX, yPos);
+          u8f.print(txt.c_str());
+        }
+      }
+    }
+  }
+}
+
+// =========================================================================
+//   BUTTON LOGIC
+// =========================================================================
+void handleButtons() {
+  if (millis() - lastButtonPress > 200) {
+    if (digitalRead(BTN_PREV) == LOW) {
+      spotify.previousTrack();
+      lastButtonPress = millis();
+    }
+    else if (digitalRead(BTN_PLAY) == LOW) {
+      if (isSpotifyPlaying) spotify.pause(); else spotify.play();
+      isSpotifyPlaying = !isSpotifyPlaying; 
+      lastButtonPress = millis();
+    }
+    else if (digitalRead(BOOT_BUTTON) == LOW) {
+      isKaraokeMode = !isKaraokeMode;
+      Serial.println(isKaraokeMode ? "Karaoke Mode ON" : "Karaoke Mode OFF");
+      forceRedraw = true; 
+      lastCheck = 0;      
+      lastButtonPress = millis();
+    }
+    else if (digitalRead(BTN_NEXT) == LOW) {
+      spotify.nextTrack();
+      lastButtonPress = millis();
+    }
+    else if (digitalRead(BTN_VOL_DOWN) == LOW) {
+      currentVolume = max(0, currentVolume - 10);
+      spotify.setVolume(currentVolume);
+      drawVolumeOverlay();
+      lastButtonPress = millis();
+    }
+    else if (digitalRead(BTN_VOL_UP) == LOW) {
+      currentVolume = min(100, currentVolume + 10);
+      spotify.setVolume(currentVolume);
+      drawVolumeOverlay();
+      lastButtonPress = millis();
+    }
+  }
+}
+
+void drawVolumeOverlay() {
+  tft.fillRect(TEXT_X, 0, 100, 20, dominantColor);
+  u8f.setFont(u8g2_font_helvB14_tf); 
+  u8f.setCursor(TEXT_X + 2, 16);    
+  u8f.setForegroundColor(TFT_WHITE);
+  u8f.setBackgroundColor(dominantColor); 
+  tft.setTextSize(1);
+  u8f.print("Vol: " + String(currentVolume) + "%");
+  u8f.setBackgroundColor(TFT_BLACK); 
+  
+  lastVolumeChangeTime = millis();
+  isVolumeVisible = true;
+}
+
+// =========================================================================
+//   DISPLAY LOGIC
+// =========================================================================
+void printCurrentlyPlaying(CurrentlyPlaying currentlyPlaying) {
+    isSpotifyPlaying = currentlyPlaying.isPlaying;
+    songDuration = currentlyPlaying.durationMs;
+    songProgress = currentlyPlaying.progressMs;
+    lastSongFetchTime = millis();
+
+    if (String(currentlyPlaying.trackUri) == lastTrackURI && !forceRedraw) return;
+    
+    bool isNewTrack = (String(currentlyPlaying.trackUri) != lastTrackURI);
+
+    lastTrackURI = String(currentlyPlaying.trackUri);
+    Serial.print("New Track: ");
+    Serial.println(currentlyPlaying.trackName);
+
+    dominantColor = 0x1DB9; 
+    backgroundColor = TFT_BLACK; 
+    
+    tft.fillRect(0, 0, tft.width(), getScreenHeight() - 10, TFT_BLACK);
+    
+    if (isNewTrack) {
+      lastBarWidth = 0; 
+      tft.fillRect(0, getScreenHeight() - 10, tft.width(), 10, backgroundColor);
+    }
+    
+    isVolumeVisible = false; 
+    forceRedraw = false; 
+
+    if (isKaraokeMode) {
+      drawKaraokeHeader(currentlyPlaying);
+      fetchLyrics(currentlyPlaying.trackName, currentlyPlaying.artists[0].artistName);
+    } else {
+      drawSongInfo(currentlyPlaying); 
+      
+      String newAlbumArtUrl = "";
+      if (currentlyPlaying.numImages > 0) {
+         if (currentlyPlaying.numImages > 1) newAlbumArtUrl = currentlyPlaying.albumImages[1].url;
+         else newAlbumArtUrl = currentlyPlaying.albumImages[0].url;
+      }
+      if (newAlbumArtUrl != "") {
+        drawAlbumArt(newAlbumArtUrl, IMG_X, IMG_Y);
+      }
+      
+      fetchLyrics(currentlyPlaying.trackName, currentlyPlaying.artists[0].artistName);
+    }
+
+    updateProgressBar();
+}
+
+void updateProgressBar() {
+  if (songDuration == 0) return;
+  long estimatedProgress = songProgress + (millis() - lastSongFetchTime);
+  if (estimatedProgress > songDuration) estimatedProgress = songDuration;
+
+  int barWidth = tft.width(); 
+  int barHeight = 6;
+  int barY = getScreenHeight() - 10; 
+  
+  int fillWidth = map(estimatedProgress, 0, songDuration, 0, barWidth);
+  
+  if (fillWidth == lastBarWidth) return; 
+
+  if (fillWidth > lastBarWidth) {
+    tft.fillRect(lastBarWidth, barY, fillWidth - lastBarWidth, barHeight, dominantColor);
+  } else {
+    tft.fillRect(0, barY, fillWidth, barHeight, dominantColor); 
+    tft.fillRect(fillWidth, barY, barWidth - fillWidth, barHeight, backgroundColor); 
+  }
+  lastBarWidth = fillWidth;
+}
+
+// =========================================================================
+//   IMAGE DOWNLOADER (BUFFERED)
+// =========================================================================
+void drawAlbumArt(String url, int xPos, int yPos) {
+  int splitIndex = url.indexOf("//") + 2;
+  int pathIndex = url.indexOf("/", splitIndex);
+  String host = url.substring(splitIndex, pathIndex);
+  String path = url.substring(pathIndex);
+
+  WiFiClientSecure imgClient;
+  imgClient.setInsecure(); 
+
+  if (imgClient.connect(host.c_str(), 443)) {
+    imgClient.print(String("GET ") + path + " HTTP/1.1\r\n" +
+                 "Host: " + host + "\r\n" +
+                 "User-Agent: ESP32\r\n" +
+                 "Connection: close\r\n\r\n");
+
+    while (imgClient.connected()) {
+      String line = imgClient.readStringUntil('\n');
+      if (line == "\r") break; 
+    }
+
+    // Reuse Global Buffer
+    jpgData.clear(); 
+
+    // OPTIMIZATION: Buffered Read
+    uint8_t buffer[4096]; // Increased buffer size
+    while (imgClient.connected() || imgClient.available()) {
+      size_t size = imgClient.available();
+      if (size) {
+        int c = imgClient.readBytes(buffer, ((size > sizeof(buffer)) ? sizeof(buffer) : size));
+        jpgData.insert(jpgData.end(), buffer, buffer + c);
+      }
+      delay(1);
+    }
+    imgClient.stop();
+    TJpgDec.drawJpg(xPos, yPos, jpgData.data(), jpgData.size());
+  } else {
+    Serial.println("Failed to connect to image server");
+  }
+}
