@@ -1,5 +1,5 @@
 /*
-  Spotify Album Art Display (No Audio)
+  Spotify Album Art Display
   
   REQUIRED LIBRARIES:
   1. TFT_eSPI
@@ -9,7 +9,6 @@
   5. ArduinoJson
 
   NOTE: 
-  - Bluetooth/Audio removed. This is a display-only device.
   - Use the built-in BOOT button (Pin 0) to toggle Karaoke Mode.
 */
 
@@ -51,7 +50,7 @@ std::vector<uint8_t> jpgData;
 unsigned long lastCheck = 0;
 unsigned long lastButtonPress = 0;
 unsigned long lastProgressBarUpdate = 0;
-int currentVolume = 30; // Volume is now controlled by phone, this tracks local display if needed
+int currentVolume = 30;
 bool isSpotifyPlaying = false;
 String lastTrackURI = ""; 
 bool forceRedraw = false; 
@@ -540,6 +539,8 @@ void printCurrentlyPlaying(CurrentlyPlaying currentlyPlaying) {
 
     if (isKaraokeMode) {
       drawKaraokeHeader(currentlyPlaying);
+      // UPDATE: Draw Progress Bar BEFORE fetching lyrics
+      updateProgressBar();
       fetchLyrics(currentlyPlaying.trackName, currentlyPlaying.artists[0].artistName);
     } else {
       drawSongInfo(currentlyPlaying); 
@@ -553,10 +554,13 @@ void printCurrentlyPlaying(CurrentlyPlaying currentlyPlaying) {
         drawAlbumArt(newAlbumArtUrl, IMG_X, IMG_Y);
       }
       
+      // UPDATE: Draw Progress Bar BEFORE fetching lyrics
+      updateProgressBar();
       fetchLyrics(currentlyPlaying.trackName, currentlyPlaying.artists[0].artistName);
     }
-
-    updateProgressBar();
+    
+    // Note: updateProgressBar is also called in loop() periodically, but this
+    // call ensures it appears immediately after screen clear.
 }
 
 void updateProgressBar() {
