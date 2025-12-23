@@ -1,10 +1,16 @@
 /*
-  Spotify Album Art Display with ESP32 & TFT_eSPI
-  UPDATE:
-  1. OPTIMIZATION: Global Image Buffer (Prevents heap fragmentation/crashes).
-  2. OPTIMIZATION: Max CPU Speed (240MHz).
-  3. OPTIMIZATION: Increased Network Read Buffer (4KB).
-  4. OPTIMIZATION: String memory reservation in text wrapper.
+  Spotify Album Art Display (No Audio)
+  
+  REQUIRED LIBRARIES:
+  1. TFT_eSPI
+  2. TJpg_Decoder
+  3. U8g2_for_TFT_eSPI
+  4. SpotifyArduino
+  5. ArduinoJson
+
+  NOTE: 
+  - Bluetooth/Audio removed. This is a display-only device.
+  - Use the built-in BOOT button (Pin 0) to toggle Karaoke Mode.
 */
 
 #include <WiFi.h>
@@ -23,7 +29,6 @@
 TFT_eSPI tft = TFT_eSPI(); 
 U8g2_for_TFT_eSPI u8f; 
 
-// --- RESOLUTION FIX ---
 #define FORCE_SCREEN_HEIGHT 320 
 
 // --- NETWORK & SPOTIFY ---
@@ -39,22 +44,17 @@ std::vector<LyricLine> currentLyrics;
 int currentLyricIndex = -1;
 bool hasLyrics = false;
 
-// --- MEMORY OPTIMIZATION: GLOBAL IMAGE BUFFER ---
-// Keeping this global prevents re-allocation and fragmentation every song
+// --- MEMORY OPTIMIZATION ---
 std::vector<uint8_t> jpgData; 
 
 // --- GLOBAL VARIABLES ---
 unsigned long lastCheck = 0;
 unsigned long lastButtonPress = 0;
 unsigned long lastProgressBarUpdate = 0;
-int currentVolume = 30;
+int currentVolume = 30; // Volume is now controlled by phone, this tracks local display if needed
 bool isSpotifyPlaying = false;
 String lastTrackURI = ""; 
 bool forceRedraw = false; 
-
-// Volume Overlay Logic
-unsigned long lastVolumeChangeTime = 0;
-bool isVolumeVisible = false;
 
 // Mode State
 bool isKaraokeMode = false; 
@@ -66,7 +66,7 @@ unsigned long lastSongFetchTime = 0;
 int lastBarWidth = 0; 
 
 // --- COLORS ---
-uint16_t dominantColor = 0x1DB9; // Fixed Spotify Green
+uint16_t dominantColor = 0x1DB9; 
 uint16_t backgroundColor = TFT_BLACK;
 
 // --- LAYOUT CONSTANTS ---
@@ -77,12 +77,8 @@ const int TEXT_W = 160;
 int lyricY = 180; 
 
 // --- PIN DEFINITIONS ---
-#define BTN_PREV      12
-#define BTN_PLAY      13
-#define BTN_NEXT      14
-#define BTN_VOL_DOWN  26
-#define BTN_VOL_UP    27
-#define BOOT_BUTTON   0 
+// Use built-in BOOT button for Karaoke toggle.
+#define BOOT_BUTTON 0 
 
 //Helper to get correct height
 int getScreenHeight() {
@@ -103,29 +99,25 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) 
 //   SETUP
 // =========================================================================
 void setup() {
-  // OPTIMIZATION: Ensure ESP32 runs at max speed
-  setCpuFrequencyMhz(240);
+  // 1. PERFORMANCE: Max CPU Speed
+  setCpuFrequencyMhz(240); 
 
   Serial.begin(115200);
-  Serial.println("\n\n--- ESP32 Spotify Booting ---");
+  Serial.println("\n\n--- ESP32 Spotify Display ---");
 
-  // OPTIMIZATION: Pre-allocate image memory to prevent runtime fragmentation
-  // 40KB is usually enough for Spotify "Medium" images
-  jpgData.reserve(40000); 
+  // Allocate slightly more to avoid re-allocation resizing
+  jpgData.reserve(55000); 
 
-  pinMode(BTN_PREV, INPUT_PULLUP);
-  pinMode(BTN_PLAY, INPUT_PULLUP);
-  pinMode(BTN_NEXT, INPUT_PULLUP);
-  pinMode(BTN_VOL_DOWN, INPUT_PULLUP); 
-  pinMode(BTN_VOL_UP, INPUT_PULLUP);   
+  // Setup Boot Button
   pinMode(BOOT_BUTTON, INPUT_PULLUP);
 
+  // 2. Setup Display
   tft.init();
   tft.setRotation(1); 
   tft.fillScreen(TFT_BLACK);
   
   u8f.begin(tft);                 
-  u8f.setFontMode(1); // 1 = Transparent Background
+  u8f.setFontMode(1); 
   u8f.setFontDirection(0);        
   u8f.setForegroundColor(TFT_WHITE);
   u8f.setBackgroundColor(TFT_BLACK); 
@@ -139,7 +131,10 @@ void setup() {
   TJpgDec.setSwapBytes(true);  
   TJpgDec.setCallback(tft_output);
 
+  // 3. Setup WiFi
   WiFi.mode(WIFI_STA);
+  // WiFi.setSleep(false); // Optional: Disable sleep for faster response, enable for power saving
+  
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -149,10 +144,9 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(10, 10);
   tft.println("WiFi Connected");
-  delay(1000);
-
+  
+  // 4. Setup Spotify API
   client.setInsecure(); 
-
   tft.println("Auth Spotify...");
   if (spotify.refreshAccessToken()) {
     Serial.println("Token refreshed!");
@@ -171,6 +165,7 @@ void setup() {
 void loop() {
   handleButtons();
 
+  // 1. Refresh Data (Every 3 seconds OR immediately if forced)
   if ((millis() - lastCheck > 3000) || lastCheck == 0) { 
     lastCheck = millis();
     
@@ -189,6 +184,7 @@ void loop() {
     }
   }
 
+  // 2. Update Progress Bar & Lyrics
   if (isSpotifyPlaying && songDuration > 0) {
     if (millis() - lastProgressBarUpdate > 100) {
       lastProgressBarUpdate = millis();
@@ -197,11 +193,6 @@ void loop() {
       else updateLyrics();
     }
   }
-
-  if (isVolumeVisible && (millis() - lastVolumeChangeTime > 3000)) {
-    isVolumeVisible = false;
-    tft.fillRect(TEXT_X, 0, 100, 20, backgroundColor);
-  }
 }
 
 // =========================================================================
@@ -209,7 +200,7 @@ void loop() {
 // =========================================================================
 String urlEncode(String str) {
     String encodedString = "";
-    encodedString.reserve(str.length() * 3); // Optimize allocation
+    encodedString.reserve(str.length() * 3); 
     char c;
     char code0;
     char code1;
@@ -233,7 +224,6 @@ String urlEncode(String str) {
 
 void parseLrc(String lrcContent) {
   currentLyrics.clear();
-  // Usually lyrics have 30-50 lines, reserve to prevent re-allocs
   if (currentLyrics.capacity() < 50) currentLyrics.reserve(50);
   
   int start = 0;
@@ -315,7 +305,7 @@ String truncateText(String text, int maxWidth) {
 int drawWrappedText(String text, int x, int y, int maxWidth, int lineHeight, int maxLines) {
   int currentY = y; 
   String currentLine = "";
-  currentLine.reserve(text.length()); // Optimize allocation
+  currentLine.reserve(text.length()); 
   int lineCount = 0;
   
   for (int i = 0; i < text.length(); i++) {
@@ -508,53 +498,15 @@ void updateKaraokeScroll() {
 // =========================================================================
 void handleButtons() {
   if (millis() - lastButtonPress > 200) {
-    if (digitalRead(BTN_PREV) == LOW) {
-      spotify.previousTrack();
-      lastButtonPress = millis();
-    }
-    else if (digitalRead(BTN_PLAY) == LOW) {
-      if (isSpotifyPlaying) spotify.pause(); else spotify.play();
-      isSpotifyPlaying = !isSpotifyPlaying; 
-      lastButtonPress = millis();
-    }
-    else if (digitalRead(BOOT_BUTTON) == LOW) {
+    // Only ONE button remains: The BOOT button for toggling Mode
+    if (digitalRead(BOOT_BUTTON) == LOW) {
       isKaraokeMode = !isKaraokeMode;
       Serial.println(isKaraokeMode ? "Karaoke Mode ON" : "Karaoke Mode OFF");
       forceRedraw = true; 
       lastCheck = 0;      
       lastButtonPress = millis();
     }
-    else if (digitalRead(BTN_NEXT) == LOW) {
-      spotify.nextTrack();
-      lastButtonPress = millis();
-    }
-    else if (digitalRead(BTN_VOL_DOWN) == LOW) {
-      currentVolume = max(0, currentVolume - 10);
-      spotify.setVolume(currentVolume);
-      drawVolumeOverlay();
-      lastButtonPress = millis();
-    }
-    else if (digitalRead(BTN_VOL_UP) == LOW) {
-      currentVolume = min(100, currentVolume + 10);
-      spotify.setVolume(currentVolume);
-      drawVolumeOverlay();
-      lastButtonPress = millis();
-    }
   }
-}
-
-void drawVolumeOverlay() {
-  tft.fillRect(TEXT_X, 0, 100, 20, dominantColor);
-  u8f.setFont(u8g2_font_helvB14_tf); 
-  u8f.setCursor(TEXT_X + 2, 16);    
-  u8f.setForegroundColor(TFT_WHITE);
-  u8f.setBackgroundColor(dominantColor); 
-  tft.setTextSize(1);
-  u8f.print("Vol: " + String(currentVolume) + "%");
-  u8f.setBackgroundColor(TFT_BLACK); 
-  
-  lastVolumeChangeTime = millis();
-  isVolumeVisible = true;
 }
 
 // =========================================================================
@@ -584,7 +536,6 @@ void printCurrentlyPlaying(CurrentlyPlaying currentlyPlaying) {
       tft.fillRect(0, getScreenHeight() - 10, tft.width(), 10, backgroundColor);
     }
     
-    isVolumeVisible = false; 
     forceRedraw = false; 
 
     if (isKaraokeMode) {
@@ -653,18 +604,24 @@ void drawAlbumArt(String url, int xPos, int yPos) {
       if (line == "\r") break; 
     }
 
-    // Reuse Global Buffer
     jpgData.clear(); 
 
-    // OPTIMIZATION: Buffered Read
-    uint8_t buffer[4096]; // Increased buffer size
+    // FIX: Stack buffer size reduced to 512 bytes
+    uint8_t buffer[512]; 
+    
     while (imgClient.connected() || imgClient.available()) {
       size_t size = imgClient.available();
       if (size) {
         int c = imgClient.readBytes(buffer, ((size > sizeof(buffer)) ? sizeof(buffer) : size));
-        jpgData.insert(jpgData.end(), buffer, buffer + c);
+        
+        // FIX: Hard limit check to prevent heap overflow
+        if (jpgData.size() + c <= 55000) {
+           jpgData.insert(jpgData.end(), buffer, buffer + c);
+        } else {
+           break; // Stop if too big
+        }
       }
-      delay(1);
+      delay(1); 
     }
     imgClient.stop();
     TJpgDec.drawJpg(xPos, yPos, jpgData.data(), jpgData.size());
