@@ -1,5 +1,5 @@
 /*
-  Spotify Album Art Display
+  Spotify Album Art Display (No Audio)
   
   REQUIRED LIBRARIES:
   1. TFT_eSPI
@@ -9,6 +9,7 @@
   5. ArduinoJson
 
   NOTE: 
+  - Bluetooth/Audio removed. This is a display-only device.
   - Use the built-in BOOT button (Pin 0) to toggle Karaoke Mode.
 */
 
@@ -50,7 +51,7 @@ std::vector<uint8_t> jpgData;
 unsigned long lastCheck = 0;
 unsigned long lastButtonPress = 0;
 unsigned long lastProgressBarUpdate = 0;
-int currentVolume = 30;
+int currentVolume = 30; // Volume is now controlled by phone, this tracks local display if needed
 bool isSpotifyPlaying = false;
 String lastTrackURI = ""; 
 bool forceRedraw = false; 
@@ -104,8 +105,9 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n\n--- ESP32 Spotify Display ---");
 
-  // Allocate slightly more to avoid re-allocation resizing
-  jpgData.reserve(55000); 
+  // UPDATE: Increased buffer to 100KB to handle complex album art (like Golden Hour)
+  // Since Bluetooth is removed, we have enough RAM for this.
+  jpgData.reserve(100000); 
 
   // Setup Boot Button
   pinMode(BOOT_BUTTON, INPUT_PULLUP);
@@ -539,7 +541,7 @@ void printCurrentlyPlaying(CurrentlyPlaying currentlyPlaying) {
 
     if (isKaraokeMode) {
       drawKaraokeHeader(currentlyPlaying);
-      // UPDATE: Draw Progress Bar BEFORE fetching lyrics
+      // UPDATE: Draw Progress Bar BEFORE fetching lyrics to ensure UI responsiveness
       updateProgressBar();
       fetchLyrics(currentlyPlaying.trackName, currentlyPlaying.artists[0].artistName);
     } else {
@@ -558,9 +560,6 @@ void printCurrentlyPlaying(CurrentlyPlaying currentlyPlaying) {
       updateProgressBar();
       fetchLyrics(currentlyPlaying.trackName, currentlyPlaying.artists[0].artistName);
     }
-    
-    // Note: updateProgressBar is also called in loop() periodically, but this
-    // call ensures it appears immediately after screen clear.
 }
 
 void updateProgressBar() {
@@ -618,8 +617,8 @@ void drawAlbumArt(String url, int xPos, int yPos) {
       if (size) {
         int c = imgClient.readBytes(buffer, ((size > sizeof(buffer)) ? sizeof(buffer) : size));
         
-        // FIX: Hard limit check to prevent heap overflow
-        if (jpgData.size() + c <= 55000) {
+        // UPDATE: Increased Safety Limit to 100KB for complex images
+        if (jpgData.size() + c <= 100000) {
            jpgData.insert(jpgData.end(), buffer, buffer + c);
         } else {
            break; // Stop if too big
