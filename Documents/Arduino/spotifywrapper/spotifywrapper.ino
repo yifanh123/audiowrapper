@@ -105,9 +105,9 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n\n--- ESP32 Spotify Display ---");
 
-  // UPDATE: Increased buffer to 100KB to handle complex album art (like Golden Hour)
-  // Since Bluetooth is removed, we have enough RAM for this.
-  jpgData.reserve(100000); 
+  // UPDATE: Reduced buffer slightly to 70KB to free up RAM for Network/SSL
+  // This balances "High Detail Images" vs "Stable Connection"
+  jpgData.reserve(70000); 
 
   // Setup Boot Button
   pinMode(BOOT_BUTTON, INPUT_PULLUP);
@@ -134,7 +134,6 @@ void setup() {
 
   // 3. Setup WiFi
   WiFi.mode(WIFI_STA);
-  // WiFi.setSleep(false); // Optional: Disable sleep for faster response, enable for power saving
   
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
@@ -172,7 +171,9 @@ void loop() {
     
     int status = spotify.getCurrentlyPlaying(printCurrentlyPlaying, SPOTIFY_MARKET);
     
-    if (status == 204) {
+    if (status == 200) {
+      // Normal operation, data handled in callback
+    } else if (status == 204) {
       if (isSpotifyPlaying) { 
         isSpotifyPlaying = false;
         tft.fillScreen(TFT_BLACK);
@@ -181,7 +182,12 @@ void loop() {
         u8f.print("Paused / Idle");
       }
     } else if (status == 401) {
+      Serial.println("Token expired (401). Refreshing...");
       spotify.refreshAccessToken();
+    } else {
+      // DEBUG: Print other errors (e.g. -1 = connection fail, 429 = rate limit)
+      Serial.print("Spotify Error: ");
+      Serial.println(status);
     }
   }
 
@@ -504,7 +510,7 @@ void handleButtons() {
       isKaraokeMode = !isKaraokeMode;
       Serial.println(isKaraokeMode ? "Karaoke Mode ON" : "Karaoke Mode OFF");
       forceRedraw = true; 
-      lastCheck = 0;      
+      lastCheck = 0;
       lastButtonPress = millis();
     }
   }
@@ -571,7 +577,8 @@ void updateProgressBar() {
   int barHeight = 6;
   int barY = getScreenHeight() - 10; 
   
-  int fillWidth = map(estimatedProgress, 0, songDuration, 0, barWidth);
+  // FIX: Use float math to prevent overflow on long songs (> 1 hour)
+  int fillWidth = (int)(((float)estimatedProgress / (float)songDuration) * barWidth);
   
   if (fillWidth == lastBarWidth) return; 
 
@@ -617,7 +624,7 @@ void drawAlbumArt(String url, int xPos, int yPos) {
       if (size) {
         int c = imgClient.readBytes(buffer, ((size > sizeof(buffer)) ? sizeof(buffer) : size));
         
-        // UPDATE: Increased Safety Limit to 100KB for complex images
+        // UPDATE: Check safety limit (100KB is risky but usually okay if no BT)
         if (jpgData.size() + c <= 100000) {
            jpgData.insert(jpgData.end(), buffer, buffer + c);
         } else {
