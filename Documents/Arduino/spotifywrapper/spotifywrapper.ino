@@ -136,11 +136,22 @@ void setup() {
   WiFi.mode(WIFI_STA);
   
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
+  int temp = 0;
+  while (WiFi.status() != WL_CONNECTED && temp <= 20) {
     delay(500);
     Serial.print(".");
+    temp++;
   }
-  
+  if (temp > 20) {
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID_PUB);
+    Serial.print("WEB");
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+  }
+
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(10, 10);
   tft.println("WiFi Connected");
