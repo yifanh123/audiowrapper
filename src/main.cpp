@@ -99,6 +99,8 @@ void updateLyrics();
 void drawAlbumArt(const String& url, int xPos, int yPos);
 bool connectWiFi(const char* ssid, const char* password, const char* label);
 void logMemory(const char* context);
+void logTftSetup();
+bool refreshSpotifyToken(const char* reason);
 
 //Helper to get correct height
 int getScreenHeight() {
@@ -112,6 +114,54 @@ void logMemory(const char* context) {
       ESP.getFreeHeap(),
       heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
       ESP.getFreePsram());
+}
+
+void logTftSetup() {
+  setup_t setup;
+  tft.getSetup(setup);
+  Serial.printf(
+      "[Display] TFT_eSPI=%s setup=\"%s\" id=%lu driver=0x%04X serial=%s\n",
+      setup.version.c_str(),
+      setup.setup_info.c_str(),
+      static_cast<unsigned long>(setup.setup_id),
+      setup.tft_driver,
+      setup.serial ? "yes" : "no");
+  Serial.printf(
+      "[Display] compiled pins: SCLK=%d MOSI=%d MISO=%d CS=%d DC=%d RST=%d; SPI=%lu Hz\n",
+      setup.pin_tft_clk,
+      setup.pin_tft_mosi,
+      setup.pin_tft_miso,
+      setup.pin_tft_cs,
+      setup.pin_tft_dc,
+      setup.pin_tft_rst,
+      static_cast<unsigned long>(setup.tft_spi_freq) * 100000UL);
+}
+
+bool refreshSpotifyToken(const char* reason) {
+  const size_t clientIdLength = strlen(SPOTIFY_CLIENT_ID);
+  const size_t clientSecretLength = strlen(SPOTIFY_CLIENT_SECRET);
+  const size_t refreshTokenLength = strlen(SPOTIFY_REFRESH_TOKEN);
+  Serial.printf(
+      "[Spotify] Token refresh (%s): client-id=%u chars, client-secret=%u chars, refresh-token=%u chars, RSSI=%d dBm\n",
+      reason,
+      static_cast<unsigned>(clientIdLength),
+      static_cast<unsigned>(clientSecretLength),
+      static_cast<unsigned>(refreshTokenLength),
+      WiFi.RSSI());
+
+  if (clientIdLength != 32 || clientSecretLength != 32 || refreshTokenLength < 80) {
+    Serial.println("[Spotify] ERROR: credential lengths are invalid; check include/secrets.h");
+    return false;
+  }
+
+  const uint32_t started = millis();
+  const bool refreshed = spotify.refreshAccessToken();
+  Serial.printf(
+      "[Spotify] Token refresh result=%s after %lu ms\n",
+      refreshed ? "success" : "FAILED",
+      millis() - started);
+  logMemory("after Spotify token refresh");
+  return refreshed;
 }
 
 bool connectWiFi(const char* ssid, const char* password, const char* label) {
@@ -192,7 +242,8 @@ void setup() {
   tft.init();
   tft.setRotation(1); 
   tft.fillScreen(TFT_BLACK);
-  Serial.printf("[Display] TFT initialized at %dx%d, rotation=1, SPI=%u Hz\n", tft.width(), tft.height(), 20000000U);
+  logTftSetup();
+  Serial.printf("[Display] initialized at %dx%d, rotation=1\n", tft.width(), tft.height());
   
   u8f.begin(tft);                 
   u8f.setFontMode(1); 
@@ -249,8 +300,7 @@ void setup() {
   
   // 4. Setup Spotify API
   tft.println("Auth Spotify...");
-  Serial.println("[Spotify] Refreshing access token");
-  spotifyAuthenticated = spotify.refreshAccessToken();
+  spotifyAuthenticated = refreshSpotifyToken("startup");
   if (spotifyAuthenticated) {
     Serial.println("[Spotify] Access token refreshed");
     tft.println("Ready!");
@@ -282,7 +332,7 @@ void loop() {
 
   if (!spotifyAuthenticated) {
     Serial.println("[Spotify] Retrying access-token refresh");
-    spotifyAuthenticated = spotify.refreshAccessToken();
+    spotifyAuthenticated = refreshSpotifyToken("retry after failure/reconnect");
     if (!spotifyAuthenticated) {
       Serial.println("[Spotify] Token refresh still failing; retrying in 3 seconds");
       delay(3000);
@@ -312,7 +362,7 @@ void loop() {
       }
     } else if (status == 401) {
       Serial.println("[Spotify] Token expired (401); refreshing");
-      spotifyAuthenticated = spotify.refreshAccessToken();
+      spotifyAuthenticated = refreshSpotifyToken("API returned 401");
     } else {
       Serial.printf("[Spotify] Request failed, HTTP/status=%d\n", status);
     }
