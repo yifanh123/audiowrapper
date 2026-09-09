@@ -1,5 +1,5 @@
 /*
-  Spotify Album Art Display (No Audio)
+  Spotify Album Art Display and Bluetooth Audio Visualizer
   
   REQUIRED LIBRARIES:
   1. TFT_eSPI
@@ -8,9 +8,7 @@
   4. SpotifyArduino
   5. ArduinoJson
 
-  NOTE: 
-  - Bluetooth/Audio removed. This is a display-only device.
-  - Use the built-in BOOT button (Pin 0) to toggle Karaoke Mode.
+  Connect a momentary button from GPIO 33 to GND to toggle Karaoke Mode.
 
   */
 #include <Arduino.h>
@@ -25,6 +23,7 @@
 #include <U8g2_for_TFT_eSPI.h> 
 #include <esp_heap_caps.h>
 #include <vector>
+#include "audio_visualizer.h"
 #include "secrets.h"
 
 // --- DISPLAY SETTINGS ---
@@ -36,7 +35,16 @@ constexpr size_t JPG_BUFFER_CAPACITY = 100000;
 constexpr uint32_t SPOTIFY_POLL_INTERVAL_MS = 3000;
 constexpr uint32_t UI_UPDATE_INTERVAL_MS = 100;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
-constexpr uint32_t NETWORK_TIMEOUT_MS = 8000;
+constexpr uint32_t NETWORK_TIMEOUT_SECONDS = 8;
+constexpr uint32_t IMAGE_TIMEOUT_MS = 5000;
+constexpr uint32_t IMAGE_TIMEOUT_SECONDS = 5;
+constexpr uint32_t LYRICS_TIMEOUT_MS = 5000;
+constexpr uint32_t LYRICS_TIMEOUT_SECONDS = 5;
+constexpr uint8_t MAX_ALBUM_ART_ATTEMPTS = 3;
+constexpr size_t PSRAM_MALLOC_THRESHOLD_BYTES = 512;
+constexpr uint32_t SCREENSAVER_FRAME_INTERVAL_MS = 150;
+constexpr int16_t SCREENSAVER_WIDTH = 164;
+constexpr int16_t SCREENSAVER_HEIGHT = 42;
 
 // --- NETWORK & SPOTIFY ---
 WiFiClientSecure client;
@@ -64,6 +72,31 @@ bool isSpotifyPlaying = false;
 bool spotifyAuthenticated = false;
 String lastTrackURI = ""; 
 bool forceRedraw = false; 
+bool screensaverActive = false;
+int16_t screensaverX = 16;
+int16_t screensaverY = 16;
+int8_t screensaverDx = 3;
+int8_t screensaverDy = 2;
+uint32_t lastScreensaverFrameAt = 0;
+uint8_t consecutiveSpotifyNetworkFailures = 0;
+bool networkErrorVisible = false;
+
+// SpotifyArduino invokes its callback while its HTTPS connection and JSON
+// document are still alive. Copy the small fields we need and wait until the
+// callback returns before opening the artwork or lyrics HTTPS connections.
+String pendingAlbumArtUrl;
+String pendingLyricsTrack;
+String pendingLyricsArtist;
+bool pendingTrackResources = false;
+bool pendingAlbumArtDraw = false;
+String queuedAlbumArtUrl;
+String queuedLyricsTrack;
+String queuedLyricsArtist;
+bool albumArtRequestPending = false;
+bool lyricsRequestPending = false;
+uint8_t albumArtAttempt = 0;
+uint32_t nextAlbumArtAttemptAt = 0;
+uint32_t nextLyricsRequestAt = 0;
 
 // Mode State
 bool isKaraokeMode = false; 
@@ -86,8 +119,9 @@ constexpr int TEXT_W = 160;
 int lyricY = 180; 
 
 // --- PIN DEFINITIONS ---
-// Use built-in BOOT button for Karaoke toggle.
-constexpr uint8_t BOOT_BUTTON = 0;
+// GPIO33 is not a boot-strapping pin. The onboard BOOT button on GPIO0 is
+// deliberately unused so pressing the mode button cannot affect startup.
+constexpr uint8_t MODE_BUTTON_PIN = 33;
 
 // Function prototypes are required in a .cpp source file. Arduino only
 // generates these automatically for .ino sketches.
@@ -96,11 +130,18 @@ void printCurrentlyPlaying(CurrentlyPlaying currentlyPlaying);
 void updateProgressBar();
 void updateKaraokeScroll();
 void updateLyrics();
-void drawAlbumArt(const String& url, int xPos, int yPos);
+void setScreensaverActive(bool active);
+void updateScreensaver();
+bool drawAlbumArt(const String& url, int xPos, int yPos);
+void processPendingTrackResources();
+bool serviceDeferredNetworkTasks();
 bool connectWiFi(const char* ssid, const char* password, const char* label);
 void logMemory(const char* context);
 void logTftSetup();
 bool refreshSpotifyToken(const char* reason);
+void onAllocationFailure(size_t size, uint32_t caps, const char* functionName);
+void noteSpotifyNetworkSuccess();
+void handleSpotifyNetworkFailure(int status);
 
 //Helper to get correct height
 int getScreenHeight() {
@@ -109,10 +150,24 @@ int getScreenHeight() {
 
 void logMemory(const char* context) {
   Serial.printf(
-      "[MEM] %s | heap=%u, largest=%u, psram=%u\n",
+      "[MEM] %s | heap=%u, internal=%u, internal-largest=%u, dma=%u, dma-largest=%u, psram=%u\n",
       context,
       ESP.getFreeHeap(),
-      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+      ESP.getFreePsram());
+}
+
+void onAllocationFailure(size_t size, uint32_t caps, const char* functionName) {
+  Serial.printf(
+      "[MEM] ALLOCATION FAILED: function=%s bytes=%u caps=0x%08lX internal-free=%u largest=%u psram=%u\n",
+      functionName != nullptr ? functionName : "unknown",
+      static_cast<unsigned>(size),
+      static_cast<unsigned long>(caps),
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
       ESP.getFreePsram());
 }
 
@@ -200,6 +255,47 @@ bool connectWiFi(const char* ssid, const char* password, const char* label) {
   return true;
 }
 
+void noteSpotifyNetworkSuccess() {
+  consecutiveSpotifyNetworkFailures = 0;
+  if (networkErrorVisible) {
+    networkErrorVisible = false;
+    // The next successful callback redraws the area used by the warning.
+    forceRedraw = true;
+    lastCheck = 0;
+    Serial.println("[Network] Spotify connectivity restored");
+  }
+}
+
+void handleSpotifyNetworkFailure(int status) {
+  ++consecutiveSpotifyNetworkFailures;
+  networkErrorVisible = true;
+  forceRedraw = true;
+
+  // Leave the last useful track information visible, but make it obvious that
+  // it is stale rather than making the screen appear frozen.
+  tft.fillRect(0, 278, 180, 30, TFT_BLACK);
+  tft.setTextColor(TFT_RED, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(8, 286);
+  tft.printf("Network error %d - retrying", status);
+
+  Serial.printf("[Network] Spotify transport failure %u/2 (status=%d, WiFi=%d, DNS=%s)\n",
+                consecutiveSpotifyNetworkFailures,
+                status,
+                static_cast<int>(WiFi.status()),
+                WiFi.dnsIP().toString().c_str());
+
+  if (consecutiveSpotifyNetworkFailures < 2) return;
+
+  Serial.println("[Network] Forcing WiFi reconnect to renew DHCP/DNS state");
+  consecutiveSpotifyNetworkFailures = 0;
+  client.stop();
+  WiFi.disconnect(false, false);
+  delay(100);
+  WiFi.reconnect();
+  lastReconnectAttempt = millis();
+}
+
 // =========================================================================
 //   JPEG DECODER CALLBACK
 // =========================================================================
@@ -220,23 +316,30 @@ void setup() {
   Serial.println("\n\n[BOOT] ESP32 Spotify Display");
   Serial.printf("[BOOT] CPU=%u MHz, SDK=%s\n", ESP.getCpuFreqMHz(), ESP.getSdkVersion());
   Serial.printf("[BOOT] PSRAM detected: %s\n", psramFound() ? "yes" : "no");
+  heap_caps_register_failed_alloc_callback(onAllocationFailure);
+
+  if (psramFound()) {
+    // Arduino's 4096-byte default keeps Spotify's ~3 KB JSON document and
+    // many TLS allocations in scarce internal RAM. Keep small objects fast,
+    // but route larger ordinary malloc/calloc requests to PSRAM. Explicit DMA
+    // allocations still remain internal as required by Wi-Fi and I2S.
+    heap_caps_malloc_extmem_enable(PSRAM_MALLOC_THRESHOLD_BYTES);
+    Serial.printf("[MEM] Ordinary allocations >= %u bytes prefer PSRAM\n",
+                  static_cast<unsigned>(PSRAM_MALLOC_THRESHOLD_BYTES));
+  }
 
   if (psramFound()) {
     jpgData = static_cast<uint8_t*>(ps_malloc(JPG_BUFFER_CAPACITY));
   }
   if (jpgData == nullptr) {
-    Serial.println("[JPEG] PSRAM allocation failed; trying internal heap");
-    jpgData = static_cast<uint8_t*>(malloc(JPG_BUFFER_CAPACITY));
-  }
-  if (jpgData == nullptr) {
-    Serial.println("[JPEG] ERROR: album-art buffer allocation failed");
+    Serial.println("[JPEG] ERROR: PSRAM album-art buffer unavailable; artwork disabled to preserve Bluetooth/Wi-Fi memory");
   } else {
     Serial.printf("[JPEG] Allocated %u-byte album-art buffer\n", JPG_BUFFER_CAPACITY);
   }
   logMemory("after JPEG buffer allocation");
 
   // Setup Boot Button
-  pinMode(BOOT_BUTTON, INPUT_PULLUP);
+  pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
 
   // 2. Setup Display
   tft.init();
@@ -260,10 +363,17 @@ void setup() {
   TJpgDec.setSwapBytes(true);  
   TJpgDec.setCallback(tft_output);
 
+  // Bluetooth audio and the matrix use only non-strapping GPIOs and do not
+  // overlap the TFT SPI bus, WROVER PSRAM, or flash pins.
+  beginAudioVisualizer();
+  logMemory("after Bluetooth audio setup");
+
   // Spotify and artwork endpoints use HTTPS. This project intentionally uses
   // an insecure TLS client because it does not bundle root CA certificates.
   client.setInsecure();
-  client.setTimeout(NETWORK_TIMEOUT_MS);
+  // WiFiClientSecure expects seconds; HTTPClient and Stream timeouts use ms.
+  client.setTimeout(NETWORK_TIMEOUT_SECONDS);
+  client.setHandshakeTimeout(NETWORK_TIMEOUT_SECONDS);
 
   // 3. Setup WiFi
   WiFi.mode(WIFI_STA);
@@ -318,7 +428,9 @@ void setup() {
 //   MAIN LOOP
 // =========================================================================
 void loop() {
+  updateAudioVisualizer();
   handleButtons();
+  updateScreensaver();
 
   if (WiFi.status() != WL_CONNECTED) {
     if (millis() - lastReconnectAttempt >= 10000) {
@@ -342,8 +454,11 @@ void loop() {
     lastCheck = 0;
   }
 
+  if (serviceDeferredNetworkTasks()) return;
+
   // 1. Refresh Data (Every 3 seconds OR immediately if forced)
-  if ((millis() - lastCheck > SPOTIFY_POLL_INTERVAL_MS) || lastCheck == 0) { 
+  if (!albumArtRequestPending && !lyricsRequestPending &&
+      ((millis() - lastCheck > SPOTIFY_POLL_INTERVAL_MS) || lastCheck == 0)) {
     lastCheck = millis();
     
     Serial.println("[Spotify] Polling currently-playing endpoint");
@@ -351,20 +466,20 @@ void loop() {
     Serial.printf("[Spotify] Poll complete, status=%d (library client cleanup may print 'Closing client')\n", status);
     
     if (status == 200) {
-      // Normal operation, data handled in callback
+      noteSpotifyNetworkSuccess();
+      // The Spotify TLS connection and response JSON are now out of the
+      // callback path, so the image/lyrics requests can safely use the heap.
+      processPendingTrackResources();
     } else if (status == 204) {
-      if (isSpotifyPlaying) { 
-        isSpotifyPlaying = false;
-        tft.fillScreen(TFT_BLACK);
-        u8f.setFont(u8g2_font_helvB14_tf); 
-        u8f.setCursor(10, 100);
-        u8f.print("Paused / Idle");
-      }
+      noteSpotifyNetworkSuccess();
+      isSpotifyPlaying = false;
+      setScreensaverActive(true);
     } else if (status == 401) {
       Serial.println("[Spotify] Token expired (401); refreshing");
       spotifyAuthenticated = refreshSpotifyToken("API returned 401");
     } else {
       Serial.printf("[Spotify] Request failed, HTTP/status=%d\n", status);
+      if (status < 0) handleSpotifyNetworkFailure(status);
     }
   }
 
@@ -468,10 +583,11 @@ void fetchLyrics(const String& trackName, const String& artistName) {
 
   WiFiClientSecure lyricsClient;
   lyricsClient.setInsecure();
-  lyricsClient.setTimeout(NETWORK_TIMEOUT_MS);
+  lyricsClient.setTimeout(LYRICS_TIMEOUT_SECONDS);
+  lyricsClient.setHandshakeTimeout(LYRICS_TIMEOUT_SECONDS);
   HTTPClient http;
-  http.setConnectTimeout(NETWORK_TIMEOUT_MS);
-  http.setTimeout(NETWORK_TIMEOUT_MS);
+  http.setConnectTimeout(LYRICS_TIMEOUT_MS);
+  http.setTimeout(LYRICS_TIMEOUT_MS);
 
   Serial.printf("[Lyrics] Requesting lyrics for \"%s\" by \"%s\"\n", trackName.c_str(), artistName.c_str());
   if (!http.begin(lyricsClient, url)) {
@@ -731,10 +847,10 @@ void updateKaraokeScroll() {
 // =========================================================================
 void handleButtons() {
   if (millis() - lastButtonPress > 200) {
-    // Only ONE button remains: The BOOT button for toggling Mode
-    if (digitalRead(BOOT_BUTTON) == LOW) {
+    // External GPIO33-to-GND button toggles the display mode.
+    if (digitalRead(MODE_BUTTON_PIN) == LOW) {
       isKaraokeMode = !isKaraokeMode;
-      Serial.printf("[UI] BOOT button: switched to %s mode\n", isKaraokeMode ? "karaoke" : "standard");
+      Serial.printf("[UI] GPIO33 mode button: switched to %s mode\n", isKaraokeMode ? "karaoke" : "standard");
       forceRedraw = true; 
       lastCheck = 0;
       lastButtonPress = millis();
@@ -745,7 +861,65 @@ void handleButtons() {
 // =========================================================================
 //   DISPLAY LOGIC
 // =========================================================================
+void setScreensaverActive(bool active) {
+  if (screensaverActive == active) return;
+  screensaverActive = active;
+  tft.fillScreen(TFT_BLACK);
+
+  if (active) {
+    // Do not let a cover or lyrics request repaint the display after Spotify
+    // has become idle. The next playing callback queues fresh resources.
+    pendingTrackResources = false;
+    albumArtRequestPending = false;
+    lyricsRequestPending = false;
+    queuedAlbumArtUrl = "";
+    queuedLyricsTrack = "";
+    queuedLyricsArtist = "";
+    screensaverX = 16;
+    screensaverY = 16;
+    screensaverDx = 3;
+    screensaverDy = 2;
+    lastScreensaverFrameAt = 0;
+    Serial.println("[Display] Spotify idle; screensaver started");
+  } else {
+    Serial.println("[Display] Spotify playback resumed; screensaver stopped");
+  }
+}
+
+void updateScreensaver() {
+  if (!screensaverActive ||
+      millis() - lastScreensaverFrameAt < SCREENSAVER_FRAME_INTERVAL_MS) return;
+  lastScreensaverFrameAt = millis();
+
+  // Erase only the previous badge instead of repainting the whole display.
+  tft.fillRoundRect(screensaverX, screensaverY,
+                    SCREENSAVER_WIDTH, SCREENSAVER_HEIGHT, 8, TFT_BLACK);
+
+  screensaverX += screensaverDx;
+  screensaverY += screensaverDy;
+  const int16_t maxX = tft.width() - SCREENSAVER_WIDTH;
+  const int16_t maxY = tft.height() - SCREENSAVER_HEIGHT;
+  if (screensaverX <= 0 || screensaverX >= maxX) {
+    screensaverX = constrain(screensaverX, 0, maxX);
+    screensaverDx = -screensaverDx;
+  }
+  if (screensaverY <= 0 || screensaverY >= maxY) {
+    screensaverY = constrain(screensaverY, 0, maxY);
+    screensaverDy = -screensaverDy;
+  }
+
+  tft.fillRoundRect(screensaverX, screensaverY,
+                    SCREENSAVER_WIDTH, SCREENSAVER_HEIGHT, 8, TFT_DARKGREEN);
+  tft.drawRoundRect(screensaverX, screensaverY,
+                    SCREENSAVER_WIDTH, SCREENSAVER_HEIGHT, 8, TFT_GREEN);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+  tft.setTextSize(2);
+  tft.setCursor(screensaverX + 10, screensaverY + 13);
+  tft.print("Spotify idle");
+}
+
 void printCurrentlyPlaying(CurrentlyPlaying currentlyPlaying) {
+  const bool wasSpotifyPlaying = isSpotifyPlaying;
   isSpotifyPlaying = currentlyPlaying.isPlaying;
   songDuration = currentlyPlaying.durationMs;
   songProgress = currentlyPlaying.progressMs;
@@ -760,6 +934,16 @@ void printCurrentlyPlaying(CurrentlyPlaying currentlyPlaying) {
   }
 
   const bool isNewTrack = !lastTrackURI.equals(trackUri);
+  if (!isSpotifyPlaying) {
+    // Remember the paused track so resuming it is treated as a redraw rather
+    // than an unnecessary new-track cover download.
+    lastTrackURI = trackUri;
+    setScreensaverActive(true);
+    return;
+  }
+
+  if (!wasSpotifyPlaying || screensaverActive) forceRedraw = true;
+  setScreensaverActive(false);
   if (!isNewTrack && !forceRedraw) return;
 
   lastTrackURI = trackUri;
@@ -788,26 +972,96 @@ void printCurrentlyPlaying(CurrentlyPlaying currentlyPlaying) {
     drawKaraokeHeader(currentlyPlaying);
   } else {
     drawSongInfo(currentlyPlaying);
-    const char* albumArtUrl = nullptr;
-    if (currentlyPlaying.numImages > 1) albumArtUrl = currentlyPlaying.albumImages[1].url;
-    else if (currentlyPlaying.numImages > 0) albumArtUrl = currentlyPlaying.albumImages[0].url;
-    if (albumArtUrl != nullptr && albumArtUrl[0] != '\0') {
-      drawAlbumArt(String(albumArtUrl), IMG_X, IMG_Y);
-    } else {
-      Serial.println("[JPEG] No album-art URL in Spotify response");
-    }
+    tft.fillRect(IMG_X, IMG_Y, 300, 300, TFT_DARKGREY);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_DARKGREY);
+    tft.setTextSize(2);
+    tft.setCursor(225, 140);
+    tft.print("Loading cover...");
   }
 
-  // Keep the interface responsive before the slower lyrics request starts.
+  const char* albumArtUrl = nullptr;
+  if (currentlyPlaying.numImages > 1) albumArtUrl = currentlyPlaying.albumImages[1].url;
+  else if (currentlyPlaying.numImages > 0) albumArtUrl = currentlyPlaying.albumImages[0].url;
+  pendingAlbumArtUrl = albumArtUrl == nullptr ? "" : albumArtUrl;
+  pendingLyricsTrack = trackName;
+  pendingLyricsArtist = artistName;
+  pendingAlbumArtDraw = !isKaraokeMode;
+  pendingTrackResources = true;
+
+  // Keep the interface responsive while the callback completes.
   updateProgressBar();
-  if (artistName[0] != '\0') {
-    fetchLyrics(String(trackName), String(artistName));
-  } else {
+}
+
+void processPendingTrackResources() {
+  if (!pendingTrackResources) return;
+  pendingTrackResources = false;
+
+  queuedAlbumArtUrl = pendingAlbumArtUrl;
+  queuedLyricsTrack = pendingLyricsTrack;
+  queuedLyricsArtist = pendingLyricsArtist;
+  pendingAlbumArtUrl = "";
+  pendingLyricsTrack = "";
+  pendingLyricsArtist = "";
+
+  albumArtAttempt = 0;
+  albumArtRequestPending = pendingAlbumArtDraw && !queuedAlbumArtUrl.isEmpty();
+  lyricsRequestPending = !queuedLyricsArtist.isEmpty();
+  nextAlbumArtAttemptAt = millis();
+  nextLyricsRequestAt = albumArtRequestPending ? UINT32_MAX : millis() + 250;
+
+  if (pendingAlbumArtDraw && queuedAlbumArtUrl.isEmpty()) {
+    Serial.println("[JPEG] No album-art URL in Spotify response");
+  }
+  if (queuedLyricsArtist.isEmpty()) {
     hasLyrics = false;
     currentLyrics.clear();
     Serial.println("[Lyrics] Skipped: Spotify response has no artist");
   }
-  logMemory("track refresh complete");
+  Serial.printf("[Network] Queued cover=%s lyrics=%s\n",
+                albumArtRequestPending ? "yes" : "no",
+                lyricsRequestPending ? "yes" : "no");
+}
+
+bool serviceDeferredNetworkTasks() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  const uint32_t now = millis();
+
+  if (albumArtRequestPending && static_cast<int32_t>(now - nextAlbumArtAttemptAt) >= 0) {
+    ++albumArtAttempt;
+    Serial.printf("[JPEG] Attempt %u/%u\n", albumArtAttempt, MAX_ALBUM_ART_ATTEMPTS);
+    logMemory("before album-art attempt");
+    if (drawAlbumArt(queuedAlbumArtUrl, IMG_X, IMG_Y)) {
+      albumArtRequestPending = false;
+      queuedAlbumArtUrl = "";
+      nextLyricsRequestAt = millis() + 250;
+    } else if (albumArtAttempt < MAX_ALBUM_ART_ATTEMPTS) {
+      const uint32_t retryDelay = albumArtAttempt == 1 ? 2000 : 5000;
+      nextAlbumArtAttemptAt = millis() + retryDelay;
+      Serial.printf("[JPEG] Retry scheduled in %lu ms\n", retryDelay);
+    } else {
+      albumArtRequestPending = false;
+      queuedAlbumArtUrl = "";
+      nextLyricsRequestAt = millis() + 250;
+      tft.fillRect(IMG_X, IMG_Y, 300, 300, TFT_DARKGREY);
+      tft.setTextColor(TFT_LIGHTGREY, TFT_DARKGREY);
+      tft.setTextSize(2);
+      tft.setCursor(220, 140);
+      tft.print("Cover unavailable");
+      Serial.println("[JPEG] All cover attempts failed");
+    }
+    return true;
+  }
+
+  if (lyricsRequestPending && !albumArtRequestPending &&
+      static_cast<int32_t>(now - nextLyricsRequestAt) >= 0) {
+    lyricsRequestPending = false;
+    fetchLyrics(queuedLyricsTrack, queuedLyricsArtist);
+    queuedLyricsTrack = "";
+    queuedLyricsArtist = "";
+    logMemory("track resources complete");
+    return true;
+  }
+  return false;
 }
 
 void updateProgressBar() {
@@ -836,10 +1090,10 @@ void updateProgressBar() {
 // =========================================================================
 //   IMAGE DOWNLOADER (BUFFERED)
 // =========================================================================
-void drawAlbumArt(const String& url, int xPos, int yPos) {
+bool drawAlbumArt(const String& url, int xPos, int yPos) {
   if (jpgData == nullptr) {
     Serial.println("[JPEG] ERROR: buffer is unavailable");
-    return;
+    return false;
   }
 
   const int schemeEnd = url.indexOf("://");
@@ -847,19 +1101,20 @@ void drawAlbumArt(const String& url, int xPos, int yPos) {
   const int pathIndex = url.indexOf('/', hostStart);
   if (pathIndex < 0 || pathIndex == hostStart) {
     Serial.printf("[JPEG] ERROR: invalid album-art URL: %s\n", url.c_str());
-    return;
+    return false;
   }
   const String host = url.substring(hostStart, pathIndex);
   const String path = url.substring(pathIndex);
 
   WiFiClientSecure imgClient;
   imgClient.setInsecure();
-  imgClient.setTimeout(NETWORK_TIMEOUT_MS);
+  imgClient.setTimeout(IMAGE_TIMEOUT_SECONDS);
+  imgClient.setHandshakeTimeout(IMAGE_TIMEOUT_SECONDS);
   const uint32_t started = millis();
   Serial.printf("[JPEG] Connecting to %s\n", host.c_str());
   if (!imgClient.connect(host.c_str(), 443)) {
     Serial.printf("[JPEG] ERROR: TLS connection to %s failed after %lu ms\n", host.c_str(), millis() - started);
-    return;
+    return false;
   }
 
   imgClient.printf(
@@ -874,7 +1129,7 @@ void drawAlbumArt(const String& url, int xPos, int yPos) {
   }
   int contentLength = -1;
   bool chunked = false;
-  while (imgClient.connected()) {
+  while (imgClient.connected() || imgClient.available()) {
     String line = imgClient.readStringUntil('\n');
     line.trim();
     if (line.isEmpty()) break;
@@ -891,17 +1146,17 @@ void drawAlbumArt(const String& url, int xPos, int yPos) {
   if (httpStatus != 200) {
     Serial.println("[JPEG] ERROR: image server returned a non-200 response");
     imgClient.stop();
-    return;
+    return false;
   }
   if (chunked) {
     Serial.println("[JPEG] ERROR: chunked image responses are not supported");
     imgClient.stop();
-    return;
+    return false;
   }
   if (contentLength > static_cast<int>(JPG_BUFFER_CAPACITY)) {
     Serial.printf("[JPEG] ERROR: image is larger than the %u-byte buffer\n", JPG_BUFFER_CAPACITY);
     imgClient.stop();
-    return;
+    return false;
   }
 
   jpgDataSize = 0;
@@ -919,7 +1174,7 @@ void drawAlbumArt(const String& url, int xPos, int yPos) {
       jpgDataSize += received;
       lastDataAt = millis();
     } else {
-      if (millis() - lastDataAt >= NETWORK_TIMEOUT_MS) {
+      if (millis() - lastDataAt >= IMAGE_TIMEOUT_MS) {
         Serial.println("[JPEG] ERROR: download timed out");
         break;
       }
@@ -930,19 +1185,20 @@ void drawAlbumArt(const String& url, int xPos, int yPos) {
 
   if (contentLength >= 0 && jpgDataSize != static_cast<size_t>(contentLength)) {
     Serial.printf("[JPEG] ERROR: incomplete download (%u/%d bytes)\n", jpgDataSize, contentLength);
-    return;
+    return false;
   }
   if (jpgDataSize >= JPG_BUFFER_CAPACITY && contentLength < 0) {
     Serial.printf("[JPEG] ERROR: download reached the %u-byte safety limit\n", JPG_BUFFER_CAPACITY);
-    return;
+    return false;
   }
   if (jpgDataSize < 2 || jpgData[0] != 0xFF || jpgData[1] != 0xD8) {
     Serial.printf("[JPEG] ERROR: response is not a valid JPEG (%u bytes)\n", jpgDataSize);
-    return;
+    return false;
   }
 
   Serial.printf("[JPEG] Downloaded %u bytes in %lu ms; decoding\n", jpgDataSize, millis() - started);
   const JRESULT result = TJpgDec.drawJpg(xPos, yPos, jpgData, jpgDataSize);
   Serial.printf("[JPEG] Decode result=%d\n", static_cast<int>(result));
   logMemory("after album art");
+  return result == JDR_OK;
 }

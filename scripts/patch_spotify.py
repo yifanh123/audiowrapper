@@ -36,6 +36,11 @@ header = header.replace(
     "#define SPOTIFY_TIMEOUT 8000",
 )
 
+# The application prints concise request status, track details, timing, and
+# memory diagnostics. Disable the library's duplicate raw JSON/status dump,
+# which can stall Serial for an entire audio frame on every three-second poll.
+header = header.replace("#define SPOTIFY_DEBUG 1", "// #define SPOTIFY_DEBUG 1")
+
 # Do not emit OAuth request bodies or returned bearer tokens to Serial.
 source = source.replace(
     "    Serial.println(body);",
