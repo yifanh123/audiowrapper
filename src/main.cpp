@@ -22,6 +22,7 @@
 #include <TJpg_Decoder.h>
 #include <U8g2_for_TFT_eSPI.h> 
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <vector>
 #include "audio_visualizer.h"
 #include "secrets.h"
@@ -32,7 +33,11 @@ U8g2_for_TFT_eSPI u8f;
 
 constexpr int SCREEN_HEIGHT = 320;
 constexpr size_t JPG_BUFFER_CAPACITY = 100000;
-constexpr uint32_t SPOTIFY_POLL_INTERVAL_MS = 3000;
+constexpr uint32_t SPOTIFY_IDLE_POLL_INTERVAL_MS = 3000;
+constexpr uint32_t SPOTIFY_CONNECTED_FALLBACK_POLL_INTERVAL_MS = 30000;
+constexpr uint32_t AVRCP_REFRESH_SETTLE_MS = 1000;
+constexpr uint32_t AVRCP_REFRESH_RETRY_MS = 5000;
+constexpr uint32_t HEALTH_LOG_INTERVAL_MS = 30000;
 constexpr uint32_t UI_UPDATE_INTERVAL_MS = 100;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
 constexpr uint32_t NETWORK_TIMEOUT_SECONDS = 8;
@@ -45,6 +50,8 @@ constexpr size_t PSRAM_MALLOC_THRESHOLD_BYTES = 512;
 constexpr uint32_t SCREENSAVER_FRAME_INTERVAL_MS = 150;
 constexpr int16_t SCREENSAVER_WIDTH = 164;
 constexpr int16_t SCREENSAVER_HEIGHT = 42;
+constexpr int16_t STATUS_STRIP_HEIGHT = 42;
+constexpr int16_t CONTENT_TOP_Y = 58;
 
 // --- NETWORK & SPOTIFY ---
 WiFiClientSecure client;
@@ -68,11 +75,18 @@ unsigned long lastCheck = 0;
 unsigned long lastButtonPress = 0;
 unsigned long lastProgressBarUpdate = 0;
 unsigned long lastReconnectAttempt = 0;
+unsigned long lastHealthLog = 0;
 bool isSpotifyPlaying = false;
 bool spotifyAuthenticated = false;
 String lastTrackURI = ""; 
 bool forceRedraw = false; 
 bool screensaverActive = false;
+bool bluetoothBadgeDrawn = false;
+bool lastBluetoothBadgeConnected = false;
+bool wifiBadgeDrawn = false;
+bool lastWifiBadgeConnected = false;
+bool bluetoothSpotifyRefreshPending = false;
+uint32_t bluetoothSpotifyRefreshAt = 0;
 int16_t screensaverX = 16;
 int16_t screensaverY = 16;
 int8_t screensaverDx = 3;
@@ -132,11 +146,14 @@ void updateKaraokeScroll();
 void updateLyrics();
 void setScreensaverActive(bool active);
 void updateScreensaver();
+void updateBluetoothBadge(bool force = false);
+void updateWifiBadge(bool force = false);
 bool drawAlbumArt(const String& url, int xPos, int yPos);
 void processPendingTrackResources();
 bool serviceDeferredNetworkTasks();
 bool connectWiFi(const char* ssid, const char* password, const char* label);
 void logMemory(const char* context);
+void logSystemHealth();
 void logTftSetup();
 bool refreshSpotifyToken(const char* reason);
 void onAllocationFailure(size_t size, uint32_t caps, const char* functionName);
@@ -158,6 +175,36 @@ void logMemory(const char* context) {
       heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
       ESP.getFreePsram());
+}
+
+const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_EXT: return "external reset";
+    case ESP_RST_SW: return "software restart";
+    case ESP_RST_PANIC: return "exception/panic";
+    case ESP_RST_INT_WDT: return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT: return "other watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep wake";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "SDIO reset";
+    default: return "unknown";
+  }
+}
+
+void logSystemHealth() {
+  const wl_status_t wifiState = WiFi.status();
+  Serial.printf(
+      "[HEALTH] uptime=%lus WiFi=%d RSSI=%d dBm BT=%s audio=%s poll=%lus\n",
+      millis() / 1000UL,
+      static_cast<int>(wifiState),
+      wifiState == WL_CONNECTED ? WiFi.RSSI() : 0,
+      isBluetoothConnected() ? "connected" : "disconnected",
+      isBluetoothAudioStreaming() ? "streaming" : "stopped",
+      (isBluetoothConnected() ? SPOTIFY_CONNECTED_FALLBACK_POLL_INTERVAL_MS
+                              : SPOTIFY_IDLE_POLL_INTERVAL_MS) / 1000UL);
+  logMemory("periodic health");
 }
 
 void onAllocationFailure(size_t size, uint32_t caps, const char* functionName) {
@@ -267,7 +314,9 @@ void noteSpotifyNetworkSuccess() {
 }
 
 void handleSpotifyNetworkFailure(int status) {
-  ++consecutiveSpotifyNetworkFailures;
+  if (consecutiveSpotifyNetworkFailures < UINT8_MAX) {
+    ++consecutiveSpotifyNetworkFailures;
+  }
   networkErrorVisible = true;
   forceRedraw = true;
 
@@ -279,21 +328,11 @@ void handleSpotifyNetworkFailure(int status) {
   tft.setCursor(8, 286);
   tft.printf("Network error %d - retrying", status);
 
-  Serial.printf("[Network] Spotify transport failure %u/2 (status=%d, WiFi=%d, DNS=%s)\n",
+  Serial.printf("[Network] Spotify transport failure %u (status=%d, WiFi=%d, DNS=%s); keeping WiFi associated\n",
                 consecutiveSpotifyNetworkFailures,
                 status,
                 static_cast<int>(WiFi.status()),
                 WiFi.dnsIP().toString().c_str());
-
-  if (consecutiveSpotifyNetworkFailures < 2) return;
-
-  Serial.println("[Network] Forcing WiFi reconnect to renew DHCP/DNS state");
-  consecutiveSpotifyNetworkFailures = 0;
-  client.stop();
-  WiFi.disconnect(false, false);
-  delay(100);
-  WiFi.reconnect();
-  lastReconnectAttempt = millis();
 }
 
 // =========================================================================
@@ -314,6 +353,9 @@ void setup() {
 
   Serial.begin(115200);
   Serial.println("\n\n[BOOT] ESP32 Spotify Display");
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  Serial.printf("[BOOT] Reset reason=%d (%s)\n",
+                static_cast<int>(resetReason), resetReasonName(resetReason));
   Serial.printf("[BOOT] CPU=%u MHz, SDK=%s\n", ESP.getCpuFreqMHz(), ESP.getSdkVersion());
   Serial.printf("[BOOT] PSRAM detected: %s\n", psramFound() ? "yes" : "no");
   heap_caps_register_failed_alloc_callback(onAllocationFailure);
@@ -422,6 +464,8 @@ void setup() {
     tft.println("Auth Failed!");
   }
   logMemory("setup complete");
+  updateBluetoothBadge(true);
+  updateWifiBadge(true);
 }
 
 // =========================================================================
@@ -431,6 +475,19 @@ void loop() {
   updateAudioVisualizer();
   handleButtons();
   updateScreensaver();
+  updateBluetoothBadge();
+  updateWifiBadge();
+
+  if (consumeBluetoothSpotifyRefreshRequest()) {
+    bluetoothSpotifyRefreshPending = true;
+    bluetoothSpotifyRefreshAt = millis() + AVRCP_REFRESH_SETTLE_MS;
+    Serial.println("[Bluetooth] AVRCP change queued a Spotify refresh");
+  }
+
+  if (millis() - lastHealthLog >= HEALTH_LOG_INTERVAL_MS) {
+    lastHealthLog = millis();
+    logSystemHealth();
+  }
 
   if (WiFi.status() != WL_CONNECTED) {
     if (millis() - lastReconnectAttempt >= 10000) {
@@ -456,30 +513,46 @@ void loop() {
 
   if (serviceDeferredNetworkTasks()) return;
 
-  // 1. Refresh Data (Every 3 seconds OR immediately if forced)
+  // AVRCP metadata/playback events provide immediate refreshes while connected.
+  // The slow poll is only a fallback for computers/apps that omit those events.
+  // When Bluetooth is absent, retain quick account-wide Spotify polling.
+  const uint32_t now = millis();
+  const uint32_t spotifyPollInterval = isBluetoothConnected()
+                                           ? SPOTIFY_CONNECTED_FALLBACK_POLL_INTERVAL_MS
+                                           : SPOTIFY_IDLE_POLL_INTERVAL_MS;
+  const bool bluetoothEventDue = bluetoothSpotifyRefreshPending &&
+      static_cast<int32_t>(now - bluetoothSpotifyRefreshAt) >= 0;
+  const bool fallbackPollDue = (now - lastCheck > spotifyPollInterval) || lastCheck == 0;
   if (!albumArtRequestPending && !lyricsRequestPending &&
-      ((millis() - lastCheck > SPOTIFY_POLL_INTERVAL_MS) || lastCheck == 0)) {
-    lastCheck = millis();
+      (bluetoothEventDue || fallbackPollDue)) {
+    lastCheck = now;
     
-    Serial.println("[Spotify] Polling currently-playing endpoint");
+    Serial.printf("[Spotify] Polling currently-playing endpoint (%s)\n",
+                  bluetoothEventDue ? "AVRCP event" : "fallback timer");
     int status = spotify.getCurrentlyPlaying(printCurrentlyPlaying, SPOTIFY_MARKET);
     Serial.printf("[Spotify] Poll complete, status=%d (library client cleanup may print 'Closing client')\n", status);
     
     if (status == 200) {
+      bluetoothSpotifyRefreshPending = false;
       noteSpotifyNetworkSuccess();
       // The Spotify TLS connection and response JSON are now out of the
       // callback path, so the image/lyrics requests can safely use the heap.
       processPendingTrackResources();
     } else if (status == 204) {
+      bluetoothSpotifyRefreshPending = false;
       noteSpotifyNetworkSuccess();
       isSpotifyPlaying = false;
       setScreensaverActive(true);
     } else if (status == 401) {
       Serial.println("[Spotify] Token expired (401); refreshing");
       spotifyAuthenticated = refreshSpotifyToken("API returned 401");
+      bluetoothSpotifyRefreshAt = millis() + AVRCP_REFRESH_RETRY_MS;
     } else {
       Serial.printf("[Spotify] Request failed, HTTP/status=%d\n", status);
       if (status < 0) handleSpotifyNetworkFailure(status);
+      if (bluetoothSpotifyRefreshPending) {
+        bluetoothSpotifyRefreshAt = millis() + AVRCP_REFRESH_RETRY_MS;
+      }
     }
   }
 
@@ -705,7 +778,8 @@ void drawSongInfo(const CurrentlyPlaying& currentlyPlaying) {
   u8f.setForegroundColor(TFT_WHITE);
   u8f.setBackgroundColor(TFT_BLACK);
   
-  int cursorY = 25; 
+  // Keep the upper-left status strip clear for the Bluetooth indicator.
+  int cursorY = CONTENT_TOP_Y;
   const String title(currentlyPlaying.trackName == nullptr ? "Unknown track" : currentlyPlaying.trackName);
   cursorY = drawWrappedText(title, TEXT_X, cursorY, TEXT_W, 24, 3);
   cursorY += 5; 
@@ -773,7 +847,8 @@ void drawKaraokeHeader(const CurrentlyPlaying& currentlyPlaying) {
   u8f.setForegroundColor(TFT_WHITE);
   u8f.setBackgroundColor(TFT_BLACK); 
   
-  int y = 30;
+  // Keep the upper-left status strip clear for the Bluetooth indicator.
+  int y = CONTENT_TOP_Y;
   const String title(currentlyPlaying.trackName == nullptr ? "Unknown track" : currentlyPlaying.trackName);
   String artist;
   if (currentlyPlaying.numArtists > 0 && currentlyPlaying.artists[0].artistName != nullptr) {
@@ -807,7 +882,7 @@ void updateKaraokeScroll() {
   if (activeIndex != currentLyricIndex) {
     currentLyricIndex = activeIndex;
     
-    int lyricAreaTop = 71; 
+    int lyricAreaTop = 96;
     tft.fillRect(0, lyricAreaTop, tft.width(), getScreenHeight() - lyricAreaTop - 10, TFT_BLACK);
     
     int lineHeight = 30; 
@@ -861,6 +936,84 @@ void handleButtons() {
 // =========================================================================
 //   DISPLAY LOGIC
 // =========================================================================
+void updateBluetoothBadge(bool force) {
+  const bool connected = isBluetoothConnected();
+  if (!force && bluetoothBadgeDrawn &&
+      connected == lastBluetoothBadgeConnected) return;
+
+  bluetoothBadgeDrawn = true;
+  lastBluetoothBadgeConnected = connected;
+
+  constexpr int16_t BADGE_X = 5;
+  constexpr int16_t BADGE_Y = 5;
+  constexpr int16_t BADGE_SIZE = 32;
+  constexpr int16_t CENTER_X = BADGE_X + BADGE_SIZE / 2;
+  constexpr int16_t CENTER_Y = BADGE_Y + BADGE_SIZE / 2;
+  const uint16_t iconColor = connected ? TFT_BLUE : TFT_DARKGREY;
+
+  // Clear the badge area, then draw the Bluetooth rune with line primitives
+  // so it does not depend on a special font or bitmap stored in flash.
+  tft.fillRect(BADGE_X, BADGE_Y, BADGE_SIZE, BADGE_SIZE, TFT_BLACK);
+  tft.drawCircle(CENTER_X, CENTER_Y, 14, iconColor);
+  tft.drawCircle(CENTER_X, CENTER_Y, 13, iconColor);
+  for (int8_t offset = -1; offset <= 1; ++offset) {
+    tft.drawLine(CENTER_X + offset, CENTER_Y - 11,
+                 CENTER_X + offset, CENTER_Y + 11, iconColor);
+    tft.drawLine(CENTER_X - 7, CENTER_Y - 7 + offset,
+                 CENTER_X + 7, CENTER_Y + 6 + offset, iconColor);
+    tft.drawLine(CENTER_X - 7, CENTER_Y + 7 + offset,
+                 CENTER_X + 7, CENTER_Y - 6 + offset, iconColor);
+  }
+  tft.drawLine(CENTER_X, CENTER_Y - 11,
+               CENTER_X + 7, CENTER_Y - 6, iconColor);
+  tft.drawLine(CENTER_X, CENTER_Y + 11,
+               CENTER_X + 7, CENTER_Y + 6, iconColor);
+
+  Serial.printf("[Display] Bluetooth icon=%s\n",
+                connected ? "connected" : "disconnected");
+}
+
+void updateWifiBadge(bool force) {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+  if (!force && wifiBadgeDrawn && connected == lastWifiBadgeConnected) return;
+
+  wifiBadgeDrawn = true;
+  lastWifiBadgeConnected = connected;
+
+  constexpr int16_t BADGE_X = 43;
+  constexpr int16_t BADGE_Y = 5;
+  constexpr int16_t BADGE_SIZE = 32;
+  constexpr int16_t CENTER_X = BADGE_X + BADGE_SIZE / 2;
+  constexpr int16_t BASE_Y = BADGE_Y + 25;
+  const uint16_t iconColor = connected ? TFT_GREEN : TFT_DARKGREY;
+
+  tft.fillRect(BADGE_X, BADGE_Y, BADGE_SIZE, BADGE_SIZE, TFT_BLACK);
+  // Three thick chevrons form a compact Wi-Fi fan without requiring a bitmap.
+  for (int8_t offset = -1; offset <= 1; ++offset) {
+    tft.drawLine(CENTER_X - 12, BASE_Y - 15 + offset,
+                 CENTER_X - 6, BASE_Y - 19 + offset, iconColor);
+    tft.drawLine(CENTER_X - 6, BASE_Y - 19 + offset,
+                 CENTER_X, BASE_Y - 20 + offset, iconColor);
+    tft.drawLine(CENTER_X, BASE_Y - 20 + offset,
+                 CENTER_X + 6, BASE_Y - 19 + offset, iconColor);
+    tft.drawLine(CENTER_X + 6, BASE_Y - 19 + offset,
+                 CENTER_X + 12, BASE_Y - 15 + offset, iconColor);
+
+    tft.drawLine(CENTER_X - 8, BASE_Y - 9 + offset,
+                 CENTER_X - 4, BASE_Y - 12 + offset, iconColor);
+    tft.drawLine(CENTER_X - 4, BASE_Y - 12 + offset,
+                 CENTER_X, BASE_Y - 13 + offset, iconColor);
+    tft.drawLine(CENTER_X, BASE_Y - 13 + offset,
+                 CENTER_X + 4, BASE_Y - 12 + offset, iconColor);
+    tft.drawLine(CENTER_X + 4, BASE_Y - 12 + offset,
+                 CENTER_X + 8, BASE_Y - 9 + offset, iconColor);
+  }
+  tft.fillCircle(CENTER_X, BASE_Y - 3, 3, iconColor);
+
+  Serial.printf("[Display] WiFi icon=%s\n",
+                connected ? "connected" : "disconnected");
+}
+
 void setScreensaverActive(bool active) {
   if (screensaverActive == active) return;
   screensaverActive = active;
@@ -876,7 +1029,7 @@ void setScreensaverActive(bool active) {
     queuedLyricsTrack = "";
     queuedLyricsArtist = "";
     screensaverX = 16;
-    screensaverY = 16;
+    screensaverY = STATUS_STRIP_HEIGHT + 6;
     screensaverDx = 3;
     screensaverDy = 2;
     lastScreensaverFrameAt = 0;
@@ -884,6 +1037,8 @@ void setScreensaverActive(bool active) {
   } else {
     Serial.println("[Display] Spotify playback resumed; screensaver stopped");
   }
+  updateBluetoothBadge(true);
+  updateWifiBadge(true);
 }
 
 void updateScreensaver() {
@@ -897,14 +1052,15 @@ void updateScreensaver() {
 
   screensaverX += screensaverDx;
   screensaverY += screensaverDy;
+  const int16_t minY = STATUS_STRIP_HEIGHT;
   const int16_t maxX = tft.width() - SCREENSAVER_WIDTH;
   const int16_t maxY = tft.height() - SCREENSAVER_HEIGHT;
   if (screensaverX <= 0 || screensaverX >= maxX) {
     screensaverX = constrain(screensaverX, 0, maxX);
     screensaverDx = -screensaverDx;
   }
-  if (screensaverY <= 0 || screensaverY >= maxY) {
-    screensaverY = constrain(screensaverY, 0, maxY);
+  if (screensaverY <= minY || screensaverY >= maxY) {
+    screensaverY = constrain(screensaverY, minY, maxY);
     screensaverDy = -screensaverDy;
   }
 
@@ -978,6 +1134,8 @@ void printCurrentlyPlaying(CurrentlyPlaying currentlyPlaying) {
     tft.setCursor(225, 140);
     tft.print("Loading cover...");
   }
+  updateBluetoothBadge(true);
+  updateWifiBadge(true);
 
   const char* albumArtUrl = nullptr;
   if (currentlyPlaying.numImages > 1) albumArtUrl = currentlyPlaying.albumImages[1].url;

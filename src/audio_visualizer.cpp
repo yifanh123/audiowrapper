@@ -22,6 +22,7 @@ constexpr uint8_t MATRIX_WIDTH = 16;
 constexpr uint8_t MATRIX_HEIGHT = 16;
 constexpr size_t NUM_LEDS = MATRIX_WIDTH * MATRIX_HEIGHT;
 constexpr uint8_t MATRIX_BRIGHTNESS = 40;
+constexpr uint8_t INITIAL_BLUETOOTH_VOLUME = 85;
 constexpr uint16_t FFT_SAMPLES = 512;
 constexpr float SAMPLE_RATE_HZ = 44100.0F;
 constexpr uint8_t BAND_COUNT = 16;
@@ -57,6 +58,12 @@ ArduinoFFT<float>* fft = nullptr;
 uint8_t bandValues[BAND_COUNT] = {};
 uint32_t lastFrameAt = 0;
 bool visualizerReady = false;
+volatile esp_a2d_connection_state_t bluetoothConnectionState =
+    ESP_A2D_CONNECTION_STATE_DISCONNECTED;
+volatile esp_a2d_audio_state_t bluetoothAudioState =
+    ESP_A2D_AUDIO_STATE_STOPPED;
+portMUX_TYPE bluetoothEventMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool bluetoothSpotifyRefreshRequested = false;
 
 uint16_t xy(uint8_t x, uint8_t y) {
   return (y & 1U)
@@ -88,10 +95,17 @@ void onAudioData(const uint8_t* data, uint32_t length) {
 }
 
 void onConnectionState(esp_a2d_connection_state_t state, void*) {
+  bluetoothConnectionState = state;
+  if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+    portENTER_CRITICAL(&bluetoothEventMux);
+    bluetoothSpotifyRefreshRequested = true;
+    portEXIT_CRITICAL(&bluetoothEventMux);
+  }
   Serial.printf("[Bluetooth] connection=%s\n", a2dpSink.to_str(state));
 }
 
 void onAudioState(esp_a2d_audio_state_t state, void*) {
+  bluetoothAudioState = state;
   Serial.printf("[Bluetooth] audio=%s\n", a2dpSink.to_str(state));
 }
 
@@ -101,6 +115,27 @@ void onSampleRate(uint16_t rate) {
 
 void onVolumeChanged(int volume) {
   Serial.printf("[Audio] Bluetooth volume=%d/127\n", volume);
+}
+
+void requestSpotifyRefreshFromBluetooth() {
+  portENTER_CRITICAL(&bluetoothEventMux);
+  bluetoothSpotifyRefreshRequested = true;
+  portEXIT_CRITICAL(&bluetoothEventMux);
+}
+
+void onAvrcMetadata(uint8_t attributeId, const uint8_t*) {
+  // Title metadata is sent at initial connection and when many computers or
+  // phones change tracks. Coalesce it with the formal track-change event.
+  if (attributeId == ESP_AVRC_MD_ATTR_TITLE) requestSpotifyRefreshFromBluetooth();
+}
+
+void onAvrcTrackChange(uint8_t*) {
+  requestSpotifyRefreshFromBluetooth();
+}
+
+void onAvrcPlayStatus(esp_avrc_playback_stat_t) {
+  // Refresh Spotify promptly on play, pause, or stop without polling rapidly.
+  requestSpotifyRefreshFromBluetooth();
 }
 
 bool takeAudioFrame() {
@@ -268,12 +303,18 @@ bool beginAudioVisualizer() {
 
   a2dpSink.set_pin_config(pins);
   a2dpSink.set_i2s_config(i2sConfig);
-  a2dpSink.set_volume(127);
+  // Start at a safe, comfortable level. AVRCP absolute-volume synchronization
+  // reports this value to the phone when the connection is established.
+  a2dpSink.set_volume(INITIAL_BLUETOOTH_VOLUME);
   a2dpSink.set_stream_reader(onAudioData, true);
   a2dpSink.set_on_connection_state_changed(onConnectionState);
   a2dpSink.set_on_audio_state_changed_post(onAudioState);
   a2dpSink.set_sample_rate_callback(onSampleRate);
   a2dpSink.set_on_volumechange(onVolumeChanged);
+  a2dpSink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE);
+  a2dpSink.set_avrc_metadata_callback(onAvrcMetadata);
+  a2dpSink.set_avrc_rn_track_change_callback(onAvrcTrackChange);
+  a2dpSink.set_avrc_rn_playstatus_callback(onAvrcPlayStatus);
 
   Serial.printf(
       "[Audio] I2S BCLK=%u LRCLK=%u DATA=%u; matrix DATA=%u; Bluetooth name=ESP32-Visualizer\n",
@@ -290,4 +331,20 @@ void updateAudioVisualizer() {
   lastFrameAt = millis();
   calculateBands();
   drawMatrix();
+}
+
+bool isBluetoothConnected() {
+  return bluetoothConnectionState == ESP_A2D_CONNECTION_STATE_CONNECTED;
+}
+
+bool isBluetoothAudioStreaming() {
+  return bluetoothAudioState == ESP_A2D_AUDIO_STATE_STARTED;
+}
+
+bool consumeBluetoothSpotifyRefreshRequest() {
+  portENTER_CRITICAL(&bluetoothEventMux);
+  const bool requested = bluetoothSpotifyRefreshRequested;
+  bluetoothSpotifyRefreshRequested = false;
+  portEXIT_CRITICAL(&bluetoothEventMux);
+  return requested;
 }
